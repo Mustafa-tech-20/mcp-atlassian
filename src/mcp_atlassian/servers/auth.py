@@ -4,7 +4,9 @@ import logging
 import secrets
 from typing import Annotated
 
+from cachetools import TTLCache
 from fastmcp import Context, FastMCP
+from ..context import MainAppContext
 from fastmcp.server.dependencies import get_http_request
 from pydantic import Field
 from starlette.requests import Request
@@ -42,6 +44,16 @@ async def initiate_oauth_login(
         return "OAuth is not configured on the server."
 
     state = secrets.token_urlsafe(16)
+
+    # Store the state and email in the cache
+    lifespan_ctx_dict = ctx.request_context.lifespan_context  # type: ignore
+    oauth_state_cache: TTLCache[str, str] | None = lifespan_ctx_dict.get("oauth_state_cache")
+    if oauth_state_cache:
+        oauth_state_cache[state] = email
+        logger.debug(f"Stored state '{state}' with email '{email}' in cache.")
+    else:
+        logger.error("oauth_state_cache not found in lifespan context.")
+
     auth_url = oauth_config.get_authorization_url(state=state)
     logger.info(f"initiate_oauth_login: Generated authorization URL: {auth_url}") # Added log
     return f"Please open the following URL in your browser to authorize the application:\n{auth_url}"
@@ -54,8 +66,18 @@ async def load_jira_token_for_user(
 ) -> str:
     """
     Loads the Jira authentication token for a given user email and makes it available for subsequent Jira operations.
+    This tool now verifies that the provided email matches the currently authenticated user's email.
     """
     request: Request = get_http_request()
+
+    authenticated_email = request.state.user_atlassian_email if hasattr(request.state, "user_atlassian_email") else None
+
+    if not authenticated_email:
+        return "Error: User not authenticated. Please complete the OAuth login flow first."
+
+    if authenticated_email.lower() != email.lower():
+        logger.error(f"Unauthorized attempt to load token: Authenticated user '{authenticated_email}' tried to load token for '{email}'.")
+        return "Error: Unauthorized. The provided email does not match the authenticated user's email."
 
     lifespan_ctx_dict = ctx.request_context.lifespan_context  # type: ignore
     app_lifespan_ctx: MainAppContext | None = (

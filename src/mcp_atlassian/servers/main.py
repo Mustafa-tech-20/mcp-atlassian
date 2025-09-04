@@ -99,8 +99,10 @@ async def main_lifespan(app: FastMCP[MainAppContext]) -> AsyncIterator[dict]:
     logger.info(f"Read-only mode: {'ENABLED' if read_only else 'DISABLED'}")
     logger.info(f"Enabled tools filter: {enabled_tools or 'All tools enabled'}")
 
+    oauth_state_cache: TTLCache[str, str] = TTLCache(maxsize=100, ttl=300) # Initialize cache here
+
     try:
-        yield {"app_lifespan_context": app_context}
+        yield {"app_lifespan_context": app_context, "oauth_state_cache": oauth_state_cache}
     except Exception as e:
         logger.error(f"Error during lifespan: {e}", exc_info=True)
         raise
@@ -282,6 +284,8 @@ token_validation_cache: TTLCache[
 ] = TTLCache(maxsize=100, ttl=300)
 
 
+
+
 class UserTokenMiddleware(BaseHTTPMiddleware):
     """Middleware to extract user tokens or load them based on user email."""
 
@@ -403,31 +407,50 @@ async def auth_callback(request: Request) -> JSONResponse:
     #     )
     #     raise HTTPException(status_code=400, detail="OAuth state mismatch")
 
-    
-    
+    # Retrieve oauth_state_cache from app.state
+    oauth_state_cache: TTLCache[str, str] | None = request.app.state.get("oauth_state_cache")
+    if not oauth_state_cache:
+        logger.error("oauth_state_cache not found in app state.")
+        raise HTTPException(status_code=500, detail="Server configuration error: OAuth state cache not available.")
+
+    typed_email = oauth_state_cache.pop(state, None) # Retrieve and remove from cache
+    if not typed_email:
+        logger.error(f"OAuth state '{state}' not found or expired in cache.")
+        raise HTTPException(status_code=400, detail="Invalid or expired OAuth state. Please restart the login process.")
+
 
     oauth_config = OAuthConfig.from_env()
     if not oauth_config:
-        logger.error("auth_callback: OAuth is not configured on the server.") # Added log
+        logger.error("auth_callback: OAuth is not configured on the server.")
         raise HTTPException(
             status_code=500, detail="OAuth is not configured on the server."
         )
 
     user_email = oauth_config.exchange_code_for_tokens(code)
 
-    if user_email:
-        logger.info(f"OAuth flow completed successfully for {user_email}. Tokens saved.")
-        return JSONResponse(
-            {
-                "status": "success",
-                "message": f"Authentication successful for {user_email}. You can now close this browser tab and return to your client.",
-                "email": user_email,
-            }
-        )
-    else:
+    if not user_email:
         raise HTTPException(
             status_code=500, detail="Failed to exchange authorization code for tokens."
         )
+
+    # Compare typed_email with verified user_email
+    if typed_email.lower() != user_email.lower():
+        logger.error(f"Email mismatch: Expected '{typed_email}', but Atlassian verified '{user_email}'.")
+        raise HTTPException(
+            status_code=403,
+            detail=f"Email mismatch: The email provided during login initiation ('{typed_email}') does not match the email verified by Atlassian ('{user_email}')."
+        )
+
+    # If emails match, set request.state.user_atlassian_email
+    request.state.user_atlassian_email = user_email
+    logger.info(f"OAuth flow completed successfully for {user_email}. Tokens saved and email set in request state.")
+    return JSONResponse(
+        {
+            "status": "success",
+            "message": f"Authentication successful for {user_email}. You can now close this browser tab and return to your client.",
+            "email": user_email,
+        }
+    )
 
 
 
