@@ -20,7 +20,7 @@ from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse,HTMLResponse
 
 from mcp_atlassian.confluence import ConfluenceFetcher
 from mcp_atlassian.confluence.config import ConfluenceConfig
@@ -387,8 +387,8 @@ async def auth_callback(request: Request) -> JSONResponse:
     """Handles the OAuth callback from Atlassian."""
     code = request.query_params.get("code")
     state = request.query_params.get("state")
-    logger.info(f"auth_callback: Received code: {code}") # Added log
-    logger.info(f"auth_callback: State from query params: {state}") # Added log
+    logger.info(f"auth_callback: Received code: {code}")  # Added log
+    logger.info(f"auth_callback: State from query params: {state}")  # Added log
 
     if not code:
         raise HTTPException(status_code=400, detail="Missing 'code' parameter")
@@ -403,12 +403,9 @@ async def auth_callback(request: Request) -> JSONResponse:
     #     )
     #     raise HTTPException(status_code=400, detail="OAuth state mismatch")
 
-    
-    
-
     oauth_config = OAuthConfig.from_env()
     if not oauth_config:
-        logger.error("auth_callback: OAuth is not configured on the server.") # Added log
+        logger.error("auth_callback: OAuth is not configured on the server.")  # Added log
         raise HTTPException(
             status_code=500, detail="OAuth is not configured on the server."
         )
@@ -417,17 +414,49 @@ async def auth_callback(request: Request) -> JSONResponse:
 
     if user_email:
         logger.info(f"OAuth flow completed successfully for {user_email}. Tokens saved.")
-        return JSONResponse(
-            {
-                "status": "success",
-                "message": f"Authentication successful for {user_email}. You can now close this browser tab and return to your client.",
-                "email": user_email,
-            }
-        )
+
+        # JSON response (exactly the same)
+        response_data = {
+            "status": "success",
+            "message": f"Authentication successful for {user_email}. You can now close this browser tab and return to your client.",
+            "email": user_email,
+        }
+
+        # Optional: HTML modal for browser rendering
+        if "text/html" in request.headers.get("accept", ""):
+            html_content = f"""
+            <!DOCTYPE html>
+            <html lang="en">
+            <head>
+                <meta charset="UTF-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <title>OAuth Success</title>
+                <script src="https://cdn.tailwindcss.com"></script>
+            </head>
+            <body class="bg-blue-50 flex items-center justify-center h-screen">
+                <div id="modal" class="fixed inset-0 bg-blue-100 bg-opacity-50 flex items-center justify-center">
+                    <div class="bg-white rounded-xl shadow-2xl p-10 max-w-md text-center border-t-4 border-blue-600">
+                        <div class="flex justify-center mb-4">
+                            <svg class="w-16 h-16 text-blue-600" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m5 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+                            </svg>
+                        </div>
+                        <h2 class="text-3xl font-bold text-blue-800 mb-4">Authentication Successful</h2>
+                        <p class="text-gray-700 mb-6">Authentication completed for <span class="font-semibold">{user_email}</span>.</p>
+                        <p class="text-gray-600 mb-6">You can now close this tab and return to your client.</p>
+                        <button onclick="document.getElementById('modal').style.display='none'" class="px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition duration-300">Close</button>
+                    </div>
+                </div>
+            </body>
+            </html>
+            """
+            return HTMLResponse(content=html_content)
+
+        else:
+            # Keep the original JSON response for API clients
+            return JSONResponse(response_data)
+
     else:
         raise HTTPException(
             status_code=500, detail="Failed to exchange authorization code for tokens."
         )
-
-
-
