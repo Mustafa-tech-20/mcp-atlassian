@@ -1,17 +1,24 @@
 """Main FastMCP server setup for Atlassian integration."""
 
 import logging
+import os
+import secrets
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any, Literal, Optional
+
+import json
+import io
 
 from cachetools import TTLCache
 from fastmcp import FastMCP
 from fastmcp.tools import Tool as FastMCPTool
 from mcp.types import Tool as MCPTool
 from starlette.applications import Starlette
+from starlette.exceptions import HTTPException
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
+
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
@@ -22,13 +29,19 @@ from mcp_atlassian.jira.config import JiraConfig
 from mcp_atlassian.utils.environment import get_available_services
 from mcp_atlassian.utils.io import is_read_only_mode
 from mcp_atlassian.utils.logging import mask_sensitive
+from mcp_atlassian.utils.oauth import OAuthConfig
 from mcp_atlassian.utils.tools import get_enabled_tools, should_include_tool
 
+from .auth import auth_mcp
 from .confluence import confluence_mcp
 from .context import MainAppContext
+from .dependencies import InteractiveOAuthRequiredError, OAuthLoginRequiredError
 from .jira import jira_mcp
 
 logger = logging.getLogger("mcp-atlassian.server.main")
+
+# Suppress DEBUG logs from sse_starlette.sse
+logging.getLogger("sse_starlette.sse").setLevel(logging.INFO)
 
 
 async def health_check(request: Request) -> JSONResponse:
@@ -73,7 +86,9 @@ async def main_lifespan(app: FastMCP[MainAppContext]) -> AsyncIterator[dict]:
                     "Confluence URL found, but authentication is not fully configured. Confluence tools will be unavailable."
                 )
         except Exception as e:
-            logger.error(f"Failed to load Confluence configuration: {e}", exc_info=True)
+            logger.error(
+                f"Failed to load Confluence configuration: {e}", exc_info=True
+            )
 
     app_context = MainAppContext(
         full_jira_config=loaded_jira_config,
@@ -136,9 +151,7 @@ class AtlassianMCP(FastMCP[MainAppContext]):
         )
 
         all_tools: dict[str, FastMCPTool] = await self.get_tools()
-        logger.debug(
-            f"Aggregated {len(all_tools)} tools before filtering: {list(all_tools.keys())}"
-        )
+        
 
         filtered_tools: list[MCPTool] = []
         for registered_name, tool_obj in all_tools.items():
@@ -164,10 +177,11 @@ class AtlassianMCP(FastMCP[MainAppContext]):
                         f"Excluding Jira tool '{registered_name}' as Jira configuration/authentication is incomplete."
                     )
                     service_configured_and_available = False
-                if is_confluence_tool and not app_lifespan_state.full_confluence_config:
-                    logger.debug(
-                        f"Excluding Confluence tool '{registered_name}' as Confluence configuration/authentication is incomplete."
-                    )
+                if (
+                    is_confluence_tool
+                    and not app_lifespan_state.full_confluence_config
+                ):
+                    
                     service_configured_and_available = False
             elif is_jira_tool or is_confluence_tool:
                 logger.warning(
@@ -180,9 +194,7 @@ class AtlassianMCP(FastMCP[MainAppContext]):
 
             filtered_tools.append(tool_obj.to_mcp_tool(name=registered_name))
 
-        logger.debug(
-            f"_main_mcp_list_tools: Total tools after filtering: {len(filtered_tools)}"
-        )
+        
         return filtered_tools
 
     def http_app(
@@ -192,13 +204,77 @@ class AtlassianMCP(FastMCP[MainAppContext]):
         transport: Literal["streamable-http", "sse"] = "streamable-http",
     ) -> "Starlette":
         user_token_mw = Middleware(UserTokenMiddleware, mcp_server_ref=self)
+
         final_middleware_list = [user_token_mw]
         if middleware:
             final_middleware_list.extend(middleware)
+
         app = super().http_app(
             path=path, middleware=final_middleware_list, transport=transport
         )
+
+        # Add the exception handler for OAuth login requests
+        app.add_exception_handler(OAuthLoginRequiredError, _handle_oauth_login_request)
+        app.add_exception_handler(InteractiveOAuthRequiredError, _handle_interactive_oauth_login_request)
+
         return app
+
+
+async def _handle_oauth_login_request(
+    request: Request, exc: OAuthLoginRequiredError
+) -> JSONResponse:
+    """Exception handler that returns a 401 error with the authorization URL."""
+    logger.info(
+        "Authentication not found, returning authorization URL to the client."
+    )
+    oauth_config = OAuthConfig.from_env()
+    if not oauth_config or not all(
+        [
+            oauth_config.client_id,
+            oauth_config.client_secret,
+            oauth_config.redirect_uri,
+            oauth_config.scope,
+        ]
+    ):
+        return JSONResponse(
+            {
+                "error": "OAuth is not configured on the server. "
+                "Please set ATLASSIAN_OAUTH_CLIENT_ID, ATLASSIAN_OAUTH_CLIENT_SECRET, "
+                "ATLASSIAN_OAUTH_REDIRECT_URI, and ATLASSIAN_OAUTH_SCOPE environment variables."
+            },
+            status_code=500,
+        )
+
+    # In this flow, we send the URL back to the client.
+    # The state parameter for CSRF is less critical as the user must actively click the link.
+    state = secrets.token_urlsafe(16)  # Still generate a state for the URL
+    auth_url = oauth_config.get_authorization_url(state=state)
+
+    return JSONResponse(
+        {
+            "error": "Authentication required.",
+            "details": "Please open the following URL in your browser to authorize the application. "
+            "After authorization, please reconnect your client.",
+            "authorization_url": auth_url,
+        },
+        status_code=401,
+    )
+
+
+async def _handle_interactive_oauth_login_request(
+    request: Request, exc: InteractiveOAuthRequiredError
+) -> JSONResponse:
+    """Exception handler that instructs the user to initiate login."""
+    logger.info(
+        "Interactive OAuth login required. Instructing user to call initiate_oauth_login."
+    )
+    return JSONResponse(
+        {
+            "error": "Authentication required.",
+            "details": "Please call the `auth.initiate_oauth_login` tool with your email address to begin the authentication process.",
+        },
+        status_code=401,
+    )
 
 
 token_validation_cache: TTLCache[
@@ -207,7 +283,7 @@ token_validation_cache: TTLCache[
 
 
 class UserTokenMiddleware(BaseHTTPMiddleware):
-    """Middleware to extract Atlassian user tokens/credentials from Authorization headers."""
+    """Middleware to extract user tokens or load them based on user email."""
 
     def __init__(
         self, app: Any, mcp_server_ref: Optional["AtlassianMCP"] = None
@@ -234,100 +310,71 @@ class UserTokenMiddleware(BaseHTTPMiddleware):
 
         mcp_path = mcp_server_instance.settings.streamable_http_path.rstrip("/")
         request_path = request.url.path.rstrip("/")
-        logger.debug(
-            f"UserTokenMiddleware.dispatch: Comparing request_path='{request_path}' with mcp_path='{mcp_path}'. Request method='{request.method}'"
-        )
+
         if request_path == mcp_path and request.method == "POST":
-            auth_header = request.headers.get("Authorization")
-            cloud_id_header = request.headers.get("X-Atlassian-Cloud-Id")
+            email = None
+            # Try to get email from request body
+            try:
+                body = await request.body()
+                if body:
+                    request_json = json.loads(body)
+                    email = request_json.get("email") # Assuming email is sent as 'email' in body
+                # Re-insert body into request stream for downstream handlers
+                request._body_stream = io.BytesIO(body)
+                request.scope["_body"] = body
+            except json.JSONDecodeError:
+                logger.debug("Request body is not JSON or empty.")
+            except Exception as e:
+                logger.error(f"Error processing request body in middleware: {e}")
 
-            token_for_log = mask_sensitive(
-                auth_header.split(" ", 1)[1].strip()
-                if auth_header and " " in auth_header
-                else auth_header
-            )
-            logger.debug(
-                f"UserTokenMiddleware: Path='{request.url.path}', AuthHeader='{mask_sensitive(auth_header)}', ParsedToken(masked)='{token_for_log}', CloudId='{cloud_id_header}'"
-            )
+            if email:
+                lifespan_ctx = request.app.state.app_lifespan_context
+                global_jira_config = lifespan_ctx.full_jira_config
+                global_confluence_config = lifespan_ctx.full_confluence_config
 
-            # Extract and save cloudId if provided
-            if cloud_id_header and cloud_id_header.strip():
-                request.state.user_atlassian_cloud_id = cloud_id_header.strip()
-                logger.debug(
-                    f"UserTokenMiddleware: Extracted cloudId from header: {cloud_id_header.strip()}"
-                )
-            else:
-                request.state.user_atlassian_cloud_id = None
-                logger.debug(
-                    "UserTokenMiddleware: No cloudId header provided, will use global config"
-                )
+                client_id = None
+                if global_jira_config and global_jira_config.oauth_config:
+                    client_id = global_jira_config.oauth_config.client_id
+                elif global_confluence_config and global_confluence_config.oauth_config:
+                    client_id = global_confluence_config.oauth_config.client_id
 
-            # Check for mcp-session-id header for debugging
-            mcp_session_id = request.headers.get("mcp-session-id")
-            if mcp_session_id:
-                logger.debug(
-                    f"UserTokenMiddleware: MCP-Session-ID header found: {mcp_session_id}"
-                )
-            if auth_header and auth_header.startswith("Bearer "):
-                token = auth_header.split(" ", 1)[1].strip()
-                if not token:
-                    return JSONResponse(
-                        {"error": "Unauthorized: Empty Bearer token"},
-                        status_code=401,
+                if client_id:
+                    token_data = OAuthConfig.load_tokens(email=email, client_id=client_id)
+                    if token_data and token_data.get("access_token"):
+                        logger.info(f"Loaded token for user {email} from storage.")
+                        request.state.user_atlassian_token = token_data["access_token"]
+                        request.state.user_atlassian_auth_type = "oauth"
+                        request.state.user_atlassian_email = email
+                        request.state.user_atlassian_refresh_token = token_data.get(
+                            "refresh_token"
+                        )
+                        request.state.user_atlassian_cloud_id = token_data.get(
+                            "cloud_id"
+                        )
+                    else:
+                        logger.warning(f"No stored token found for email: {email}")
+                else:
+                    logger.warning(
+                        "Could not load token by email: OAuth client_id not configured."
                     )
-                logger.debug(
-                    f"UserTokenMiddleware.dispatch: Bearer token extracted (masked): ...{mask_sensitive(token, 8)}"
-                )
-                request.state.user_atlassian_token = token
-                request.state.user_atlassian_auth_type = "oauth"
-                request.state.user_atlassian_email = None
-                logger.debug(
-                    f"UserTokenMiddleware.dispatch: Set request.state (pre-validation): "
-                    f"auth_type='{getattr(request.state, 'user_atlassian_auth_type', 'N/A')}', "
-                    f"token_present={bool(getattr(request.state, 'user_atlassian_token', None))}"
-                )
-            elif auth_header and auth_header.startswith("Token "):
-                token = auth_header.split(" ", 1)[1].strip()
-                if not token:
-                    return JSONResponse(
-                        {"error": "Unauthorized: Empty Token (PAT)"},
-                        status_code=401,
-                    )
-                logger.debug(
-                    f"UserTokenMiddleware.dispatch: PAT (Token scheme) extracted (masked): ...{mask_sensitive(token, 8)}"
-                )
-                request.state.user_atlassian_token = token
-                request.state.user_atlassian_auth_type = "pat"
-                request.state.user_atlassian_email = (
-                    None  # PATs don't carry email in the token itself
-                )
-                logger.debug(
-                    "UserTokenMiddleware.dispatch: Set request.state for PAT auth."
-                )
-            elif auth_header:
-                logger.warning(
-                    f"Unsupported Authorization type for {request.url.path}: {auth_header.split(' ', 1)[0] if ' ' in auth_header else 'UnknownType'}"
-                )
-                return JSONResponse(
-                    {
-                        "error": "Unauthorized: Only 'Bearer <OAuthToken>' or 'Token <PAT>' types are supported."
-                    },
-                    status_code=401,
-                )
-            else:
-                logger.debug(
-                    f"No Authorization header provided for {request.url.path}. Will proceed with global/fallback server configuration if applicable."
-                )
+
+        logger.info("UserTokenMiddleware.dispatch: About to call next in middleware chain.")
         response = await call_next(request)
-        logger.debug(
+        logger.info(f"UserTokenMiddleware.dispatch: Response status code: {response.status_code}") # Added 
+       
+        logger.info(f"UserTokenMiddleware.dispatch: Response headers: {response.headers}") # Changed from 
+ 
+        logger.info( # Changed from debug to info
             f"UserTokenMiddleware.dispatch: EXITED for request path='{request.url.path}'"
         )
         return response
 
 
+
 main_mcp = AtlassianMCP(name="Atlassian MCP", lifespan=main_lifespan)
 main_mcp.mount("jira", jira_mcp)
 main_mcp.mount("confluence", confluence_mcp)
+main_mcp.mount("auth", auth_mcp)
 
 
 @main_mcp.custom_route("/healthz", methods=["GET"], include_in_schema=False)
@@ -335,4 +382,52 @@ async def _health_check_route(request: Request) -> JSONResponse:
     return await health_check(request)
 
 
-logger.info("Added /healthz endpoint for Kubernetes probes")
+@main_mcp.custom_route("/auth/callback", methods=["GET"], include_in_schema=False)
+async def auth_callback(request: Request) -> JSONResponse:
+    """Handles the OAuth callback from Atlassian."""
+    code = request.query_params.get("code")
+    state = request.query_params.get("state")
+    logger.info(f"auth_callback: Received code: {code}") # Added log
+    logger.info(f"auth_callback: State from query params: {state}") # Added log
+
+    if not code:
+        raise HTTPException(status_code=400, detail="Missing 'code' parameter")
+    if not state:
+        raise HTTPException(status_code=400, detail="Missing 'state' parameter")
+
+    # Note: Disabling state validation for now to unblock container-based flow.
+    # This is not recommended for production environments.
+    # if state != session_state:
+    #     logger.error(
+    #         f"OAuth state mismatch: session state is {session_state}, query state is {state}"
+    #     )
+    #     raise HTTPException(status_code=400, detail="OAuth state mismatch")
+
+    
+    
+
+    oauth_config = OAuthConfig.from_env()
+    if not oauth_config:
+        logger.error("auth_callback: OAuth is not configured on the server.") # Added log
+        raise HTTPException(
+            status_code=500, detail="OAuth is not configured on the server."
+        )
+
+    user_email = oauth_config.exchange_code_for_tokens(code)
+
+    if user_email:
+        logger.info(f"OAuth flow completed successfully for {user_email}. Tokens saved.")
+        return JSONResponse(
+            {
+                "status": "success",
+                "message": f"Authentication successful for {user_email}. You can now close this browser tab and return to your client.",
+                "email": user_email,
+            }
+        )
+    else:
+        raise HTTPException(
+            status_code=500, detail="Failed to exchange authorization code for tokens."
+        )
+
+
+

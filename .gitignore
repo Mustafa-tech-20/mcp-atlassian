@@ -75,3 +75,4 @@ playground/
 
 # Claude
 .claude/
+.credentials/

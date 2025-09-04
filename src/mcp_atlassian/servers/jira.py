@@ -31,6 +31,7 @@ async def get_user_profile(
             description="Identifier for the user (e.g., email address 'user@example.com', username 'johndoe', account ID 'accountid:...', or key for Server/DC)."
         ),
     ],
+    mcptoolset_context: dict | None = None, 
 ) -> str:
     """
     Retrieve profile information for a specific Jira user.
@@ -128,6 +129,7 @@ async def get_issue(
             default=True,
         ),
     ] = True,
+    mcptoolset_context: dict | None = None, 
 ) -> str:
     """Get details of a specific Jira issue including its Epic links and relationship information.
 
@@ -218,6 +220,7 @@ async def search(
             default=None,
         ),
     ] = None,
+    mcptoolset_context: dict | None = None, 
 ) -> str:
     """Search Jira issues using JQL (Jira Query Language).
 
@@ -267,6 +270,7 @@ async def search_fields(
         bool,
         Field(description="Whether to force refresh the field list", default=False),
     ] = False,
+    mcptoolset_context: dict | None = None, 
 ) -> str:
     """Search Jira fields by keyword with fuzzy match.
 
@@ -296,6 +300,7 @@ async def get_project_issues(
         int,
         Field(description="Starting index for pagination (0-based)", default=0, ge=0),
     ] = 0,
+    mcptoolset_context: dict | None = None, 
 ) -> str:
     """Get all issues for a specific Jira project.
 
@@ -320,6 +325,7 @@ async def get_project_issues(
 async def get_transitions(
     ctx: Context,
     issue_key: Annotated[str, Field(description="Jira issue key (e.g., 'PROJ-123')")],
+    mcptoolset_context: dict | None = None, 
 ) -> str:
     """Get available status transitions for a Jira issue.
 
@@ -340,6 +346,7 @@ async def get_transitions(
 async def get_worklog(
     ctx: Context,
     issue_key: Annotated[str, Field(description="Jira issue key (e.g., 'PROJ-123')")],
+    mcptoolset_context: dict | None = None, 
 ) -> str:
     """Get worklog entries for a Jira issue.
 
@@ -363,6 +370,7 @@ async def download_attachments(
     target_dir: Annotated[
         str, Field(description="Directory where attachments should be saved")
     ],
+    mcptoolset_context: dict | None = None, 
 ) -> str:
     """Download attachments from a Jira issue.
 
@@ -403,6 +411,7 @@ async def get_agile_boards(
         int,
         Field(description="Maximum number of results (1-50)", default=10, ge=1, le=50),
     ] = 10,
+    mcptoolset_context: dict | None = None, 
 ) -> str:
     """Get jira agile boards by name, project key, or type.
 
@@ -474,6 +483,7 @@ async def get_board_issues(
             default="version",
         ),
     ] = "version",
+    mcptoolset_context: dict | None = None, 
 ) -> str:
     """Get all issues linked to a specific board filtered by JQL.
 
@@ -522,6 +532,7 @@ async def get_sprints_from_board(
         int,
         Field(description="Maximum number of results (1-50)", default=10, ge=1, le=50),
     ] = 10,
+    mcptoolset_context: dict | None = None, 
 ) -> str:
     """Get jira sprints from board by state.
 
@@ -566,6 +577,7 @@ async def get_sprint_issues(
         int,
         Field(description="Maximum number of results (1-50)", default=10, ge=1, le=50),
     ] = 10,
+    mcptoolset_context: dict | None = None, 
 ) -> str:
     """Get jira issues from sprint.
 
@@ -592,7 +604,10 @@ async def get_sprint_issues(
 
 
 @jira_mcp.tool(tags={"jira", "read"})
-async def get_link_types(ctx: Context) -> str:
+async def get_link_types(
+    ctx: Context,
+    mcptoolset_context: dict | None = None,
+) -> str:
     """Get all available issue link types.
 
     Args:
@@ -663,6 +678,7 @@ async def create_issue(
             default=None,
         ),
     ] = None,
+    mcptoolset_context: dict | None = None, 
 ) -> str:
     """Create a new Jira issue with optional Epic link or parent for subtasks.
 
@@ -741,6 +757,7 @@ async def batch_create_issues(
             default=False,
         ),
     ] = False,
+    mcptoolset_context: dict | None = None, 
 ) -> str:
     """Create multiple Jira issues in a batch.
 
@@ -809,6 +826,7 @@ async def batch_get_changelogs(
             default=-1,
         ),
     ] = -1,
+    mcptoolset_context: dict | None = None, 
 ) -> str:
     """Get changelogs for multiple Jira issues (Cloud only).
 
@@ -884,6 +902,7 @@ async def update_issue(
             default=None,
         ),
     ] = None,
+    mcptoolset_context: dict | None = None, 
 ) -> str:
     """Update an existing Jira issue including changing status, adding Epic links, updating fields, etc.
 
@@ -959,6 +978,7 @@ async def update_issue(
 async def delete_issue(
     ctx: Context,
     issue_key: Annotated[str, Field(description="Jira issue key (e.g. PROJ-123)")],
+    mcptoolset_context: dict | None = None, 
 ) -> str:
     """Delete an existing Jira issue.
 
@@ -985,6 +1005,7 @@ async def add_comment(
     ctx: Context,
     issue_key: Annotated[str, Field(description="Jira issue key (e.g., 'PROJ-123')")],
     comment: Annotated[str, Field(description="Comment text in Markdown format")],
+    mcptoolset_context: dict | None = None, 
 ) -> str:
     """Add a comment to a Jira issue.
 
@@ -1039,6 +1060,7 @@ async def add_worklog(
     remaining_estimate: Annotated[
         str | None, Field(description="(Optional) New value for the remaining estimate")
     ] = None,
+    mcptoolset_context: dict | None = None, 
 ) -> str:
     """Add a worklog entry to a Jira issue.
 
@@ -1082,6 +1104,7 @@ async def link_to_epic(
     epic_key: Annotated[
         str, Field(description="The key of the epic to link to (e.g., 'PROJ-456')")
     ],
+    mcptoolset_context: dict | None = None, 
 ) -> str:
     """Link an existing issue to an epic.
 
@@ -1131,6 +1154,7 @@ async def create_issue_link(
             default=None,
         ),
     ] = None,
+    mcptoolset_context: dict | None = None, 
 ) -> str:
     """Create a link between two Jira issues.
 
@@ -1205,6 +1229,7 @@ async def create_remote_issue_link(
     icon_url: Annotated[
         str | None, Field(description="(Optional) URL to a 16x16 icon for the link")
     ] = None,
+    mcptoolset_context: dict | None = None, 
 ) -> str:
     """Create a remote issue link (web link or Confluence link) for a Jira issue.
 
@@ -1260,6 +1285,7 @@ async def create_remote_issue_link(
 async def remove_issue_link(
     ctx: Context,
     link_id: Annotated[str, Field(description="The ID of the link to remove")],
+    mcptoolset_context: dict | None = None, 
 ) -> str:
     """Remove a link between two Jira issues.
 
@@ -1315,6 +1341,7 @@ async def transition_issue(
             ),
         ),
     ] = None,
+    mcptoolset_context: dict | None = None, 
 ) -> str:
     """Transition a Jira issue to a new status.
 
@@ -1371,6 +1398,7 @@ async def create_sprint(
     goal: Annotated[
         str | None, Field(description="(Optional) Goal of the sprint")
     ] = None,
+    mcptoolset_context: dict | None = None, 
 ) -> str:
     """Create Jira sprint for a board.
 
@@ -1420,6 +1448,7 @@ async def update_sprint(
     goal: Annotated[
         str | None, Field(description="(Optional) New goal for the sprint")
     ] = None,
+    mcptoolset_context: dict | None = None, 
 ) -> str:
     """Update jira sprint.
 
@@ -1461,6 +1490,7 @@ async def update_sprint(
 async def get_project_versions(
     ctx: Context,
     project_key: Annotated[str, Field(description="Jira project key (e.g., 'PROJ')")],
+    mcptoolset_context: dict | None = None, 
 ) -> str:
     """Get all fix versions for a specific Jira project."""
     jira = await get_jira_fetcher(ctx)
@@ -1478,6 +1508,7 @@ async def get_all_projects(
             default=False,
         ),
     ] = False,
+    mcptoolset_context: dict | None = None, 
 ) -> str:
     """Get all Jira projects accessible to the current user.
 
@@ -1548,6 +1579,7 @@ async def create_version(
     description: Annotated[
         str | None, Field(description="Description of the version", default=None)
     ] = None,
+    mcptoolset_context: dict | None = None, 
 ) -> str:
     """Create a new fix version in a Jira project.
 
@@ -1602,6 +1634,7 @@ async def batch_create_versions(
             )
         ),
     ],
+    mcptoolset_context: dict | None = None, 
 ) -> str:
     """Batch create multiple versions in a Jira project.
 

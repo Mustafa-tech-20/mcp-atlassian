@@ -17,7 +17,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
-import keyring
 import requests
 
 # Configure logging
@@ -27,8 +26,12 @@ logger = logging.getLogger("mcp-atlassian.oauth")
 TOKEN_URL = "https://auth.atlassian.com/oauth/token"  # noqa: S105 - This is a public API endpoint URL, not a password
 AUTHORIZE_URL = "https://auth.atlassian.com/authorize"
 CLOUD_ID_URL = "https://api.atlassian.com/oauth/token/accessible-resources"
+USER_PROFILE_URL = "https://api.atlassian.com/me"
 TOKEN_EXPIRY_MARGIN = 300  # 5 minutes in seconds
 KEYRING_SERVICE_NAME = "mcp-atlassian-oauth"
+
+# Determine the project root dynamically and set the credentials directory path
+CREDENTIALS_DIR = Path("/tmp/.credentials")
 
 
 @dataclass
@@ -85,14 +88,14 @@ class OAuthConfig:
         }
         return f"{AUTHORIZE_URL}?{urllib.parse.urlencode(params)}"
 
-    def exchange_code_for_tokens(self, code: str) -> bool:
+    def exchange_code_for_tokens(self, code: str) -> str | None:
         """Exchange the authorization code for access and refresh tokens.
 
         Args:
             code: The authorization code from the callback
 
         Returns:
-            True if tokens were successfully acquired, False otherwise.
+            The user's email if tokens were successfully acquired, None otherwise.
         """
         try:
             payload = {
@@ -108,7 +111,6 @@ class OAuthConfig:
 
             response = requests.post(TOKEN_URL, data=payload)
 
-            # Log more details about the response
             logger.debug(f"Token exchange response status: {response.status_code}")
             logger.debug(
                 f"Token exchange response headers: {pprint.pformat(response.headers)}"
@@ -119,44 +121,42 @@ class OAuthConfig:
                 logger.error(
                     f"Token exchange failed with status {response.status_code}. Response: {response.text}"
                 )
-                return False
+                return None
 
-            # Parse the response
             token_data = response.json()
 
-            # Check if required tokens are present
             if "access_token" not in token_data:
                 logger.error(
                     f"Access token not found in response. Keys found: {list(token_data.keys())}"
                 )
-                return False
+                return None
 
             if "refresh_token" not in token_data:
                 logger.error(
                     "Refresh token not found in response. Ensure 'offline_access' scope is included. "
                     f"Keys found: {list(token_data.keys())}"
                 )
-                return False
+                return None
 
             self.access_token = token_data["access_token"]
             self.refresh_token = token_data["refresh_token"]
             self.expires_at = time.time() + token_data["expires_in"]
 
+            # Get user email
+            user_email = self._get_user_email()
+            if not user_email:
+                logger.error("Failed to retrieve user email after token exchange.")
+                return None
+
             # Get the cloud ID using the access token
             self._get_cloud_id()
 
-            # Save the tokens
-            self._save_tokens()
+            # Save the tokens, associated with the user's email
+            self._save_tokens(email=user_email)
 
-            # Log success message with token details
             logger.info(
-                f"✅ OAuth token exchange successful! Access token expires in {token_data['expires_in']}s."
-            )
-            logger.info(
-                f"Access Token (partial): {self.access_token[:10]}...{self.access_token[-5:] if self.access_token else ''}"
-            )
-            logger.info(
-                f"Refresh Token (partial): {self.refresh_token[:5]}...{self.refresh_token[-3:] if self.refresh_token else ''}"
+                f"✅ OAuth token exchange successful for user {user_email}! "
+                f"Access token expires in {token_data['expires_in']}s."
             )
             if self.cloud_id:
                 logger.info(f"Cloud ID successfully retrieved: {self.cloud_id}")
@@ -164,10 +164,10 @@ class OAuthConfig:
                 logger.warning(
                     "Cloud ID was not retrieved after token exchange. Check accessible resources."
                 )
-            return True
+            return user_email
         except requests.exceptions.RequestException as e:
             logger.error(f"Network error during token exchange: {e}", exc_info=True)
-            return False
+            return None
         except json.JSONDecodeError as e:
             logger.error(
                 f"Failed to decode JSON response from token endpoint: {e}",
@@ -176,13 +176,16 @@ class OAuthConfig:
             logger.error(
                 f"Response text that failed to parse: {response.text if 'response' in locals() else 'Response object not available'}"
             )
-            return False
+            return None
         except Exception as e:
             logger.error(f"Failed to exchange code for tokens: {e}")
-            return False
+            return None
 
-    def refresh_access_token(self) -> bool:
+    def refresh_access_token(self, email: str) -> bool:
         """Refresh the access token using the refresh token.
+
+        Args:
+            email: The user's email to identify which token to refresh.
 
         Returns:
             True if the token was successfully refreshed, False otherwise.
@@ -203,38 +206,35 @@ class OAuthConfig:
             response = requests.post(TOKEN_URL, data=payload)
             response.raise_for_status()
 
-            # Parse the response
             token_data = response.json()
             self.access_token = token_data["access_token"]
-            # Refresh token might also be rotated
             if "refresh_token" in token_data:
                 self.refresh_token = token_data["refresh_token"]
             self.expires_at = time.time() + token_data["expires_in"]
 
-            # Save the tokens
-            self._save_tokens()
+            # Save the updated tokens
+            self._save_tokens(email=email)
 
             return True
         except Exception as e:
             logger.error(f"Failed to refresh access token: {e}")
             return False
 
-    def ensure_valid_token(self) -> bool:
+    def ensure_valid_token(self, email: str) -> bool:
         """Ensure the access token is valid, refreshing if necessary.
+
+        Args:
+            email: The user's email to identify the token.
 
         Returns:
             True if the token is valid (or was refreshed successfully), False otherwise.
         """
         if not self.is_token_expired:
             return True
-        return self.refresh_access_token()
+        return self.refresh_access_token(email=email)
 
     def _get_cloud_id(self) -> None:
-        """Get the cloud ID for the Atlassian instance.
-
-        This method queries the accessible resources endpoint to get the cloud ID.
-        The cloud ID is needed for API calls with OAuth.
-        """
+        """Get the cloud ID for the Atlassian instance."""
         if not self.access_token:
             logger.debug("No access token available to get cloud ID")
             return
@@ -246,8 +246,6 @@ class OAuthConfig:
 
             resources = response.json()
             if resources and len(resources) > 0:
-                # Use the first cloud site (most users have only one)
-                # For users with multiple sites, they might need to specify which one to use
                 self.cloud_id = resources[0]["id"]
                 logger.debug(f"Found cloud ID: {self.cloud_id}")
             else:
@@ -255,61 +253,44 @@ class OAuthConfig:
         except Exception as e:
             logger.error(f"Failed to get cloud ID: {e}")
 
-    def _get_keyring_username(self) -> str:
-        """Get the keyring username for storing tokens.
-
-        The username is based on the client ID to allow multiple OAuth apps.
-
-        Returns:
-            A username string for keyring
-        """
-        return f"oauth-{self.client_id}"
-
-    def _save_tokens(self) -> None:
-        """Save the tokens securely using keyring for later use.
-
-        This allows the tokens to be reused between runs without requiring
-        the user to go through the authorization flow again.
-        """
+    def _get_user_email(self) -> str | None:
+        """Get the user's email using the access token."""
+        if not self.access_token:
+            logger.error("Cannot get user email without an access token.")
+            return None
         try:
-            username = self._get_keyring_username()
-
-            # Store token data as JSON string in keyring
-            token_data = {
-                "refresh_token": self.refresh_token,
-                "access_token": self.access_token,
-                "expires_at": self.expires_at,
-                "cloud_id": self.cloud_id,
-            }
-
-            # Store the token data in the system keyring
-            keyring.set_password(KEYRING_SERVICE_NAME, username, json.dumps(token_data))
-
-            logger.debug(f"Saved OAuth tokens to keyring for {username}")
-
-            # Also maintain backwards compatibility with file storage
-            # for environments where keyring might not work
-            self._save_tokens_to_file(token_data)
-
+            headers = {"Authorization": f"Bearer {self.access_token}"}
+            response = requests.get(USER_PROFILE_URL, headers=headers)
+            response.raise_for_status()
+            profile_data = response.json()
+            email = profile_data.get("email")
+            if email:
+                logger.info(f"Retrieved user email: {email}")
+                return email
+            else:
+                logger.error(f"Could not find 'email' in user profile response: {profile_data}")
+                return None
         except Exception as e:
-            logger.error(f"Failed to save tokens to keyring: {e}")
-            # Fall back to file storage if keyring fails
-            self._save_tokens_to_file()
+            logger.error(f"Failed to get user profile: {e}", exc_info=True)
+            return None
 
-    def _save_tokens_to_file(self, token_data: dict = None) -> None:
-        """Save the tokens to a file as fallback storage.
+    def _get_keyring_username(self, email: str) -> str:
+        """Get the keyring username for storing tokens, scoped by email."""
+        return f"oauth-{self.client_id}-{email}"
 
-        Args:
-            token_data: Optional dict with token data. If not provided,
-                        will use the current object attributes.
-        """
+    def _save_tokens(self, email: str) -> None:
+        """Save the tokens securely, associated with a user's email."""
+        self._save_tokens_to_file(email)
+
+    def _save_tokens_to_file(self, email: str, token_data: dict = None) -> None:
+        """Save the tokens to a file as fallback, named by email."""
         try:
-            # Create the directory if it doesn't exist
-            token_dir = Path.home() / ".mcp-atlassian"
+            # Use a project-local directory for credentials
+            token_dir = CREDENTIALS_DIR
             token_dir.mkdir(exist_ok=True)
-
-            # Save the tokens to a file
-            token_path = token_dir / f"oauth-{self.client_id}.json"
+            # Sanitize email for filename
+            safe_email = urllib.parse.quote_plus(email)
+            token_path = token_dir / f"oauth-credentials-{self.client_id}-{safe_email}.json"
 
             if token_data is None:
                 token_data = {
@@ -318,61 +299,32 @@ class OAuthConfig:
                     "expires_at": self.expires_at,
                     "cloud_id": self.cloud_id,
                 }
-
             with open(token_path, "w") as f:
                 json.dump(token_data, f)
-
-            logger.debug(f"Saved OAuth tokens to file {token_path} (fallback storage)")
+            logger.info(f"Saved OAuth tokens to file {token_path}")
         except Exception as e:
             logger.error(f"Failed to save tokens to file: {e}")
 
     @staticmethod
-    def load_tokens(client_id: str) -> dict[str, Any]:
-        """Load tokens securely from keyring.
-
-        Args:
-            client_id: The OAuth client ID
-
-        Returns:
-            Dict with the token data or empty dict if no tokens found
-        """
-        username = f"oauth-{client_id}"
-
-        # Try to load tokens from keyring first
-        try:
-            token_json = keyring.get_password(KEYRING_SERVICE_NAME, username)
-            if token_json:
-                logger.debug(f"Loaded OAuth tokens from keyring for {username}")
-                return json.loads(token_json)
-        except Exception as e:
-            logger.warning(
-                f"Failed to load tokens from keyring: {e}. Trying file fallback."
-            )
-
-        # Fall back to loading from file if keyring fails or returns None
-        return OAuthConfig._load_tokens_from_file(client_id)
+    def load_tokens(email: str, client_id: str) -> dict[str, Any]:
+        """Load tokens for a specific user from keyring or file."""
+        return OAuthConfig._load_tokens_from_file(email, client_id)
 
     @staticmethod
-    def _load_tokens_from_file(client_id: str) -> dict[str, Any]:
-        """Load tokens from a file as fallback.
+    def _load_tokens_from_file(email: str, client_id: str) -> dict[str, Any]:
+        """Load tokens from a file for a specific user."""
+        safe_email = urllib.parse.quote_plus(email)
+        # Use a project-local directory for credentials
+        token_path = CREDENTIALS_DIR / f"oauth-credentials-{client_id}-{safe_email}.json"
 
-        Args:
-            client_id: The OAuth client ID
-
-        Returns:
-            Dict with the token data or empty dict if no tokens found
-        """
-        token_path = Path.home() / ".mcp-atlassian" / f"oauth-{client_id}.json"
-
+        logger.debug(f"Attempting to load token from {token_path}")
         if not token_path.exists():
+            logger.warning(f"Token file not found at {token_path}")
             return {}
-
         try:
             with open(token_path) as f:
                 token_data = json.load(f)
-                logger.debug(
-                    f"Loaded OAuth tokens from file {token_path} (fallback storage)"
-                )
+                logger.debug(f"Loaded OAuth tokens from file {token_path}")
                 return token_data
         except Exception as e:
             logger.error(f"Failed to load tokens from file: {e}")
@@ -380,61 +332,44 @@ class OAuthConfig:
 
     @classmethod
     def from_env(cls) -> Optional["OAuthConfig"]:
-        """Create an OAuth configuration from environment variables.
-
-        Returns:
-            OAuthConfig instance or None if OAuth is not enabled
-        """
-        # Check if OAuth is explicitly enabled (allows minimal config)
-        oauth_enabled = os.getenv("ATLASSIAN_OAUTH_ENABLE", "").lower() in (
-            "true",
-            "1",
-            "yes",
-        )
-
-        # Check for required environment variables
+        """Create an OAuth configuration from environment variables."""
+        oauth_enabled = os.getenv("ATLASSIAN_OAUTH_ENABLE", "").lower() in ("true", "1", "yes")
         client_id = os.getenv("ATLASSIAN_OAUTH_CLIENT_ID")
         client_secret = os.getenv("ATLASSIAN_OAUTH_CLIENT_SECRET")
         redirect_uri = os.getenv("ATLASSIAN_OAUTH_REDIRECT_URI")
         scope = os.getenv("ATLASSIAN_OAUTH_SCOPE")
 
-        # Full OAuth configuration (traditional mode)
+        if scope:
+            # Ensure 'read:me' scope is always present for user email retrieval
+            if "read:me" not in scope:
+                logger.warning("'read:me' scope is missing from ATLASSIAN_OAUTH_SCOPE. Adding it automatically for user email retrieval.")
+                scope += " read:me"
+        else:
+            # Provide a default scope if not set, including 'read:me'
+            logger.info("ATLASSIAN_OAUTH_SCOPE not set. Using default scopes including 'read:me'.")
+            scope = "offline_access read:jira-work write:jira-work read:jira-user manage:jira-project read:confluence-content.all write:confluence-content read:confluence-space.summary read:confluence-user write:confluence-file search:confluence read:me"
+
         if all([client_id, client_secret, redirect_uri, scope]):
-            # Create the OAuth configuration with full credentials
-            config = cls(
+            # Create the config but DO NOT load tokens yet.
+            # Token loading is now handled by the middleware which has the user's email.
+            return cls(
                 client_id=client_id,
                 client_secret=client_secret,
                 redirect_uri=redirect_uri,
                 scope=scope,
                 cloud_id=os.getenv("ATLASSIAN_OAUTH_CLOUD_ID"),
             )
-
-            # Try to load existing tokens
-            token_data = cls.load_tokens(client_id)
-            if token_data:
-                config.refresh_token = token_data.get("refresh_token")
-                config.access_token = token_data.get("access_token")
-                config.expires_at = token_data.get("expires_at")
-                if not config.cloud_id and "cloud_id" in token_data:
-                    config.cloud_id = token_data["cloud_id"]
-
-            return config
-
-        # Minimal OAuth configuration (user-provided tokens mode)
         elif oauth_enabled:
-            # Create minimal config that works with user-provided tokens
             logger.info(
                 "Creating minimal OAuth config for user-provided tokens (ATLASSIAN_OAUTH_ENABLE=true)"
             )
             return cls(
-                client_id="",  # Will be provided by user tokens
-                client_secret="",  # Not needed for user tokens
-                redirect_uri="",  # Not needed for user tokens
-                scope="",  # Will be determined by user token permissions
-                cloud_id=os.getenv("ATLASSIAN_OAUTH_CLOUD_ID"),  # Optional fallback
+                client_id="",
+                client_secret="",
+                redirect_uri="",
+                scope="",
+                cloud_id=os.getenv("ATLASSIAN_OAUTH_CLOUD_ID"),
             )
-
-        # No OAuth configuration
         return None
 
 

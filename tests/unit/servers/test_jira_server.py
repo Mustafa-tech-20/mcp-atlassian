@@ -1081,7 +1081,7 @@ async def test_batch_create_versions_all_success(jira_client, mock_jira_fetcher)
     # Patch create_project_version to always succeed
     mock_jira_fetcher.create_project_version.side_effect = lambda **kwargs: {
         "id": f"{kwargs['name']}-id",
-        **kwargs,
+        mcptoolset_context: dict | None = None, 
     }
     response = await jira_client.call_tool(
         "jira_batch_create_versions",

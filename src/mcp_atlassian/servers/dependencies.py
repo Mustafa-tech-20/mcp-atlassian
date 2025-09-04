@@ -18,6 +18,19 @@ from mcp_atlassian.jira import JiraConfig, JiraFetcher
 from mcp_atlassian.servers.context import MainAppContext
 from mcp_atlassian.utils.oauth import OAuthConfig
 
+
+class OAuthLoginRequiredError(Exception):
+    """Custom exception to signal that OAuth login is required."""
+
+    pass
+
+
+class InteractiveOAuthRequiredError(Exception):
+    """Custom exception to signal that an interactive OAuth flow is required."""
+
+    pass
+
+
 if TYPE_CHECKING:
     from mcp_atlassian.confluence.config import (
         ConfluenceConfig as UserConfluenceConfigType,
@@ -249,13 +262,20 @@ async def get_jira_fetcher(ctx: Context) -> JiraFetcher:
         else None
     )
     if app_lifespan_ctx_global and app_lifespan_ctx_global.full_jira_config:
+        global_config = app_lifespan_ctx_global.full_jira_config
+        # If the global config is OAuth, it requires a user token. Don't proceed.
+        if global_config.auth_type == "oauth":
+            raise InteractiveOAuthRequiredError(
+                "Jira authentication required. Please initiate the OAuth flow."
+            )
+
         logger.debug(
             "get_jira_fetcher: Using global JiraFetcher from lifespan_context. "
-            f"Global config auth_type: {app_lifespan_ctx_global.full_jira_config.auth_type}"
+            f"Global config auth_type: {global_config.auth_type}"
         )
-        return JiraFetcher(config=app_lifespan_ctx_global.full_jira_config)
+        return JiraFetcher(config=global_config)
     logger.error("Jira configuration could not be resolved.")
-    raise ValueError(
+    raise OAuthLoginRequiredError(
         "Jira client (fetcher) not available. Ensure server is configured correctly."
     )
 
@@ -373,12 +393,19 @@ async def get_confluence_fetcher(ctx: Context) -> ConfluenceFetcher:
         else None
     )
     if app_lifespan_ctx_global and app_lifespan_ctx_global.full_confluence_config:
+        global_config = app_lifespan_ctx_global.full_confluence_config
+        # If the global config is OAuth, it requires a user token. Don't proceed.
+        if global_config.auth_type == "oauth":
+            raise InteractiveOAuthRequiredError(
+                "Confluence authentication required. Please initiate the OAuth flow."
+            )
+
         logger.debug(
             "get_confluence_fetcher: Using global ConfluenceFetcher from lifespan_context. "
-            f"Global config auth_type: {app_lifespan_ctx_global.full_confluence_config.auth_type}"
+            f"Global config auth_type: {global_config.auth_type}"
         )
-        return ConfluenceFetcher(config=app_lifespan_ctx_global.full_confluence_config)
+        return ConfluenceFetcher(config=global_config)
     logger.error("Confluence configuration could not be resolved.")
-    raise ValueError(
+    raise OAuthLoginRequiredError(
         "Confluence client (fetcher) not available. Ensure server is configured correctly."
     )
