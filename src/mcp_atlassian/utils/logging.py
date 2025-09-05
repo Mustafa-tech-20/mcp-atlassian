@@ -42,7 +42,10 @@ def setup_logging(
 
     for logger_name in loggers:
         logger = logging.getLogger(logger_name)
-        logger.setLevel(level)
+        if logger_name == "mcp.server.lowlevel.server":
+            logger.setLevel(logging.INFO) # Suppress DEBUG logs from this specific logger
+        else:
+            logger.setLevel(level)
 
     # Return the application logger
     return logging.getLogger("mcp-atlassian")

@@ -358,15 +358,15 @@ class UserTokenMiddleware(BaseHTTPMiddleware):
                         "Could not load token by email: OAuth client_id not configured."
                     )
 
-        logger.info("UserTokenMiddleware.dispatch: About to call next in middleware chain.")
+        # logger.info("UserTokenMiddleware.dispatch: About to call next in middleware chain.")
         response = await call_next(request)
-        logger.info(f"UserTokenMiddleware.dispatch: Response status code: {response.status_code}") # Added 
+        # logger.info(f"UserTokenMiddleware.dispatch: Response status code: {response.status_code}") # Added 
        
-        logger.info(f"UserTokenMiddleware.dispatch: Response headers: {response.headers}") # Changed from 
+        # logger.info(f"UserTokenMiddleware.dispatch: Response headers: {response.headers}") # Changed from 
  
-        logger.info( # Changed from debug to info
-            f"UserTokenMiddleware.dispatch: EXITED for request path='{request.url.path}'"
-        )
+        # logger.info( # Changed from debug to info
+        #     f"UserTokenMiddleware.dispatch: EXITED for request path='{request.url.path}'"
+        # )
         return response
 
 
