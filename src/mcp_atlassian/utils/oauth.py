@@ -18,6 +18,8 @@ from pathlib import Path
 from typing import Any, Optional
 
 import requests
+from google.api_core.exceptions import NotFound
+from google.cloud import storage
 
 # Configure logging
 logger = logging.getLogger("mcp-atlassian.oauth")
@@ -28,10 +30,11 @@ AUTHORIZE_URL = "https://auth.atlassian.com/authorize"
 CLOUD_ID_URL = "https://api.atlassian.com/oauth/token/accessible-resources"
 USER_PROFILE_URL = "https://api.atlassian.com/me"
 TOKEN_EXPIRY_MARGIN = 300  # 5 minutes in seconds
-KEYRING_SERVICE_NAME = "mcp-atlassian-oauth"
+
 
 # Determine the project root dynamically and set the credentials directory path
 CREDENTIALS_DIR = Path("/tmp/.credentials")
+GCS_BUCKET_NAME = os.getenv("ATLASSIAN_OAUTH_GCS_BUCKET_NAME")
 
 
 @dataclass
@@ -50,6 +53,7 @@ class OAuthConfig:
     redirect_uri: str
     scope: str
     cloud_id: str | None = None
+    email: str | None = None
     refresh_token: str | None = None
     access_token: str | None = None
     expires_at: float | None = None
@@ -181,17 +185,13 @@ class OAuthConfig:
             logger.error(f"Failed to exchange code for tokens: {e}")
             return None
 
-    def refresh_access_token(self, email: str) -> bool:
-        """Refresh the access token using the refresh token.
-
-        Args:
-            email: The user's email to identify which token to refresh.
-
-        Returns:
-            True if the token was successfully refreshed, False otherwise.
-        """
+    def refresh_access_token(self) -> bool:
+        """Refresh the access token using the refresh token."""
         if not self.refresh_token:
             logger.error("No refresh token available")
+            return False
+        if not self.email:
+            logger.error("Cannot refresh token without an email address.")
             return False
 
         try:
@@ -213,25 +213,18 @@ class OAuthConfig:
             self.expires_at = time.time() + token_data["expires_in"]
 
             # Save the updated tokens
-            self._save_tokens(email=email)
+            self._save_tokens(email=self.email)
 
             return True
         except Exception as e:
             logger.error(f"Failed to refresh access token: {e}")
             return False
 
-    def ensure_valid_token(self, email: str) -> bool:
-        """Ensure the access token is valid, refreshing if necessary.
-
-        Args:
-            email: The user's email to identify the token.
-
-        Returns:
-            True if the token is valid (or was refreshed successfully), False otherwise.
-        """
+    def ensure_valid_token(self) -> bool:
+        """Ensure the access token is valid, refreshing if necessary."""
         if not self.is_token_expired:
             return True
-        return self.refresh_access_token(email=email)
+        return self.refresh_access_token()
 
     def _get_cloud_id(self) -> None:
         """Get the cloud ID for the Atlassian instance."""
@@ -274,13 +267,59 @@ class OAuthConfig:
             logger.error(f"Failed to get user profile: {e}", exc_info=True)
             return None
 
-    def _get_keyring_username(self, email: str) -> str:
-        """Get the keyring username for storing tokens, scoped by email."""
-        return f"oauth-{self.client_id}-{email}"
+    def _get_token_path(self, email: str) -> str:
+        """Get the path for storing tokens, scoped by email."""
+        safe_email = urllib.parse.quote_plus(email)
+        return f"oauth-credentials-{self.client_id}-{safe_email}.json"
+
+    def _save_tokens_to_gcs(self, email: str, token_data: dict = None) -> None:
+        """Save the tokens to a GCS bucket, named by email."""
+        try:
+            storage_client = storage.Client()
+            bucket = storage_client.bucket(GCS_BUCKET_NAME)
+            blob = bucket.blob(self._get_token_path(email))
+
+            if token_data is None:
+                token_data = {
+                    "refresh_token": self.refresh_token,
+                    "access_token": self.access_token,
+                    "expires_at": self.expires_at,
+                    "cloud_id": self.cloud_id,
+                }
+            blob.upload_from_string(json.dumps(token_data), content_type="application/json")
+            logger.info(f"Saved OAuth tokens to GCS bucket {GCS_BUCKET_NAME}")
+        except Exception as e:
+            logger.error(f"Failed to save tokens to GCS: {e}")
+
+    @staticmethod
+    def _load_tokens_from_gcs(email: str, client_id: str) -> dict[str, Any]:
+        """Load tokens from a GCS bucket for a specific user."""
+        try:
+            storage_client = storage.Client()
+            bucket = storage_client.bucket(GCS_BUCKET_NAME)
+            safe_email = urllib.parse.quote_plus(email)
+            blob_name = f"oauth-credentials-{client_id}-{safe_email}.json"
+            blob = bucket.blob(blob_name)
+            
+            logger.debug(f"Attempting to load token from GCS bucket {GCS_BUCKET_NAME}/{blob_name}")
+            token_data = json.loads(blob.download_as_string())
+            logger.debug(f"Loaded OAuth tokens from GCS bucket {GCS_BUCKET_NAME}")
+            return token_data
+        except NotFound:
+            logger.warning(f"Token file not found in GCS bucket {GCS_BUCKET_NAME}")
+            return {}
+        except Exception as e:
+            logger.error(f"Failed to load tokens from GCS: {e}")
+            return {}
+
+    
 
     def _save_tokens(self, email: str) -> None:
         """Save the tokens securely, associated with a user's email."""
-        self._save_tokens_to_file(email)
+        if GCS_BUCKET_NAME:
+            self._save_tokens_to_gcs(email)
+        else:
+            self._save_tokens_to_file(email)
 
     def _save_tokens_to_file(self, email: str, token_data: dict = None) -> None:
         """Save the tokens to a file as fallback, named by email."""
@@ -288,9 +327,7 @@ class OAuthConfig:
             # Use a project-local directory for credentials
             token_dir = CREDENTIALS_DIR
             token_dir.mkdir(exist_ok=True)
-            # Sanitize email for filename
-            safe_email = urllib.parse.quote_plus(email)
-            token_path = token_dir / f"oauth-credentials-{self.client_id}-{safe_email}.json"
+            token_path = token_dir / self._get_token_path(email)
 
             if token_data is None:
                 token_data = {
@@ -307,7 +344,9 @@ class OAuthConfig:
 
     @staticmethod
     def load_tokens(email: str, client_id: str) -> dict[str, Any]:
-        """Load tokens for a specific user from keyring or file."""
+        """Load tokens for a specific user from GCS or file."""
+        if GCS_BUCKET_NAME:
+            return OAuthConfig._load_tokens_from_gcs(email, client_id)
         return OAuthConfig._load_tokens_from_file(email, client_id)
 
     @staticmethod
@@ -371,6 +410,26 @@ class OAuthConfig:
                 cloud_id=os.getenv("ATLASSIAN_OAUTH_CLOUD_ID"),
             )
         return None
+
+    @classmethod
+    def load_for_user(cls, email: str) -> Optional["OAuthConfig"]:
+        """Create an OAuth configuration from environment variables and load tokens for a specific user."""
+        config = cls.from_env()
+        if not config:
+            return None
+
+        config.email = email  # Set the email on the config object
+
+        token_data = cls.load_tokens(email, config.client_id)
+        if not token_data:
+            return config  # Return base config if no tokens are found
+
+        config.access_token = token_data.get("access_token")
+        config.refresh_token = token_data.get("refresh_token")
+        config.expires_at = token_data.get("expires_at")
+        config.cloud_id = token_data.get("cloud_id") or config.cloud_id
+
+        return config
 
 
 @dataclass

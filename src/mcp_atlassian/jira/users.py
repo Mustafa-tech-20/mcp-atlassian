@@ -88,21 +88,22 @@ class UsersMixin(JiraClient):
             error_msg = f"Unable to get current user account ID: {e}"
             raise Exception(error_msg) from e
 
-    def _get_account_id(self, assignee: str) -> str:
-        """
-        Get the account ID for a username or account ID.
+    def _get_account_id(self, assignee: str | dict) -> str | None:
+        """Get the account ID for a user by email or display name."""
 
-        Args:
-            assignee (str): Username or account ID.
+        if isinstance(assignee, dict):
+            # Prioritize accountId if present, then email, then name
+            if assignee.get("accountId"):
+                return assignee["accountId"]
+            assignee_str = assignee.get("emailAddress") or assignee.get("name")
+            if not assignee_str:
+                raise ValueError(
+                    "Assignee dictionary must contain 'accountId', 'emailAddress', or 'name'."
+                )
+            assignee = assignee_str
 
-        Returns:
-            str: Account ID.
-
-        Raises:
-            ValueError: If the account ID could not be found.
-        """
-        # If it looks like an account ID already, return it
-        if assignee.startswith("5") and len(assignee) >= 10:
+        # If it looks like an account ID, just return it
+        if isinstance(assignee, str) and assignee.startswith("5") and len(assignee) >= 10:
             return assignee
 
         account_id = self._lookup_user_directly(assignee)

@@ -27,6 +27,7 @@ dependencies = [
     "cachetools>=5.0.0",
     "types-cachetools>=5.5.0.20240820",
     "itsdangerous>=2.1.2",
+    "google-cloud-storage>=2.10.0",
 ]
 [[project.authors]]
 name = "sooperset"
